@@ -12,6 +12,12 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 import io
 import os
+try:
+    import pytesseract
+    from PIL import Image as PILImage
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 # ========== ページ設定 ==========
 st.set_page_config(
@@ -148,6 +154,104 @@ def render_page_image(page, dpi, img_fmt="png"):
     return buf
 
 
+def ocr_page_to_textboxes(slide, page, x_scale, y_scale, ocr_dpi=200):
+    """
+    OCRでページからテキストを認識してテキストボックスを追加する。
+    戻り値: 追加したテキストボックス数
+    """
+    if not OCR_AVAILABLE:
+        return 0
+
+    zoom = ocr_dpi / 72
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+
+    try:
+        data = pytesseract.image_to_data(
+            img, lang="jpn+eng",
+            config="--psm 6",
+            output_type=pytesseract.Output.DICT
+        )
+    except Exception:
+        try:
+            # jpn が入っていない場合は eng のみで試みる
+            data = pytesseract.image_to_data(
+                img, lang="eng",
+                config="--psm 6",
+                output_type=pytesseract.Output.DICT
+            )
+        except Exception:
+            return 0
+
+    # 単語を (block_num, par_num, line_num) でグループ化して1行＝1テキストボックス
+    lines = {}
+    for i, text in enumerate(data["text"]):
+        if not text.strip():
+            continue
+        conf = int(data["conf"][i])
+        if conf < 30:   # 信頼度が低い認識結果はスキップ
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if key not in lines:
+            lines[key] = {
+                "words": [],
+                "left":   data["left"][i],
+                "top":    data["top"][i],
+                "right":  data["left"][i] + data["width"][i],
+                "bottom": data["top"][i]  + data["height"][i],
+                "height": data["height"][i],
+            }
+        else:
+            lines[key]["right"]  = max(lines[key]["right"],  data["left"][i] + data["width"][i])
+            lines[key]["bottom"] = max(lines[key]["bottom"], data["top"][i]  + data["height"][i])
+            lines[key]["height"] = max(lines[key]["height"], data["height"][i])
+        lines[key]["words"].append(text)
+
+    n_added = 0
+    for line_data in lines.values():
+        line_text = " ".join(line_data["words"]).strip()
+        if not line_text:
+            continue
+
+        # ピクセル座標 → PDF ポイント座標 → EMU
+        x0 = line_data["left"]   / zoom
+        y0 = line_data["top"]    / zoom
+        w  = (line_data["right"] - line_data["left"]) / zoom
+        h  = (line_data["bottom"] - line_data["top"]) / zoom
+
+        left_emu = int(x0 * x_scale)
+        top_emu  = int(y0 * y_scale)
+        w_emu    = int(w  * x_scale)
+        h_emu    = int(h  * y_scale)
+
+        if w_emu < 10000 or h_emu < 5000:
+            continue
+
+        # フォントサイズをOCR行高さから推定（高さの約70%がフォントサイズに相当）
+        font_pt = max(6, (line_data["height"] / zoom) * 0.70)
+
+        txBox = slide.shapes.add_textbox(
+            Emu(left_emu), Emu(top_emu),
+            Emu(w_emu + 100000), Emu(h_emu + 50000)
+        )
+        tf = txBox.text_frame
+        tf.word_wrap     = False
+        tf.margin_left   = Emu(0)
+        tf.margin_right  = Emu(0)
+        tf.margin_top    = Emu(0)
+        tf.margin_bottom = Emu(0)
+
+        para = tf.paragraphs[0]
+        run  = para.add_run()
+        run.text      = line_text
+        run.font.size = Pt(font_pt)
+        run.font.color.rgb = RGBColor(0, 0, 0)
+
+        n_added += 1
+
+    return n_added
+
+
 def convert_image_mode(doc, dpi, img_fmt, progress_bar):
     """画像モード：各ページを1枚の画像としてスライドに変換"""
     emu_per_point = 914400 / 72
@@ -272,81 +376,83 @@ def convert_edit_mode(doc, keep_bg, dpi, progress_bar):
             except Exception:
                 pass
 
-        # ── テキストブロックをテキストボックスとして追加 ─
-        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP)
-
-        for block in text_dict.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-
-            bx0, by0, bx1, by1 = block["bbox"]
-            bw, bh = bx1 - bx0, by1 - by0
-            if bw <= 0 or bh <= 0:
-                continue
-
-            # ブロック内の実際のテキストを収集
-            all_text = "".join(
+        # ── テキストブロックをテキストボックスとして追加（OCRフォールバック付き）─
+        text_dict   = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP)
+        text_blocks = [
+            b for b in text_dict.get("blocks", [])
+            if b.get("type") == 0
+            and "".join(
                 span.get("text", "")
-                for line in block.get("lines", [])
+                for line in b.get("lines", [])
                 for span in line.get("spans", [])
+            ).strip()
+        ]
+
+        if text_blocks:
+            # ── 通常のテキスト抽出 ──
+            for block in text_blocks:
+                bx0, by0, bx1, by1 = block["bbox"]
+                bw, bh = bx1 - bx0, by1 - by0
+                if bw <= 0 or bh <= 0:
+                    continue
+
+                left_emu = int(bx0 * x_scale)
+                top_emu  = int(by0 * y_scale)
+                w_emu    = int(bw  * x_scale)
+                h_emu    = int(bh  * y_scale)
+
+                if w_emu < 5000 or h_emu < 5000:
+                    continue
+
+                txBox = slide.shapes.add_textbox(
+                    Emu(left_emu), Emu(top_emu),
+                    Emu(w_emu + 50000), Emu(h_emu + 50000)
+                )
+                tf = txBox.text_frame
+                tf.word_wrap     = True
+                tf.auto_size     = None
+                tf.margin_left   = Emu(0)
+                tf.margin_right  = Emu(0)
+                tf.margin_top    = Emu(0)
+                tf.margin_bottom = Emu(0)
+
+                first_para = True
+                for line in block.get("lines", []):
+                    if first_para:
+                        para = tf.paragraphs[0]
+                        first_para = False
+                    else:
+                        para = tf.add_paragraph()
+
+                    for span in line.get("spans", []):
+                        text = span.get("text", "")
+                        if not text:
+                            continue
+                        run      = para.add_run()
+                        run.text = text
+                        font     = run.font
+                        font.size = Pt(max(1, span.get("size", 11)))
+                        try:
+                            font.color.rgb = color_int_to_rgb(span.get("color", 0))
+                        except Exception:
+                            pass
+                        flags        = span.get("flags", 0)
+                        font.bold    = bool(flags & 16)
+                        font.italic  = bool(flags & 2)
+                        try:
+                            font.name = clean_font_name(span.get("font", ""))
+                        except Exception:
+                            pass
+
+                total_textboxes += 1
+        else:
+            # ── OCRフォールバック（日本語フォントなど通常抽出不可のPDF向け）──
+            progress_bar.progress(
+                (page_idx + 0.5) / num_pages,
+                text=f"ページ {page_idx+1}/{num_pages}: OCRで文字認識中..."
             )
-            if not all_text.strip():
-                continue  # 空ブロックはスキップ
-
-            left_emu = int(bx0 * x_scale)
-            top_emu  = int(by0 * y_scale)
-            w_emu    = int(bw  * x_scale)
-            h_emu    = int(bh  * y_scale)
-
-            if w_emu < 5000 or h_emu < 5000:
-                continue
-
-            txBox = slide.shapes.add_textbox(
-                Emu(left_emu), Emu(top_emu),
-                Emu(w_emu + 50000), Emu(h_emu + 50000)
-            )
-            tf = txBox.text_frame
-            tf.word_wrap    = True
-            tf.auto_size    = None
-            tf.margin_left  = Emu(0)
-            tf.margin_right = Emu(0)
-            tf.margin_top   = Emu(0)
-            tf.margin_bottom= Emu(0)
-
-            first_para = True
-            for line in block.get("lines", []):
-                if first_para:
-                    para = tf.paragraphs[0]
-                    first_para = False
-                else:
-                    para = tf.add_paragraph()
-
-                for span in line.get("spans", []):
-                    text = span.get("text", "")
-                    if not text:
-                        continue
-
-                    run      = para.add_run()
-                    run.text = text
-                    font     = run.font
-
-                    font.size = Pt(max(1, span.get("size", 11)))
-
-                    try:
-                        font.color.rgb = color_int_to_rgb(span.get("color", 0))
-                    except Exception:
-                        pass
-
-                    flags        = span.get("flags", 0)
-                    font.bold    = bool(flags & 16)
-                    font.italic  = bool(flags & 2)
-
-                    try:
-                        font.name = clean_font_name(span.get("font", ""))
-                    except Exception:
-                        pass
-
-            total_textboxes += 1
+            n_ocr = ocr_page_to_textboxes(slide, page, x_scale, y_scale)
+            total_textboxes += n_ocr
 
         progress_bar.progress((page_idx + 1) / num_pages, text=f"ページ {page_idx+1}/{num_pages} 変換中...")
 
@@ -432,7 +538,6 @@ else:
                 if total_textboxes == 0:
                     st.warning(
                         "⚠️ テキストを抽出できませんでした。\n\n"
-                        "このPDFはスキャン画像や特殊なフォントを使用している可能性があります。\n"
                         "「**背景画像も保持する**」にチェックを入れて再変換するか、**画像モード**をお試しください。"
                     )
                 else:
