@@ -81,10 +81,9 @@ if not is_edit_mode:
 else:
     st.markdown("""
     <div class="mode-explain">
-        ✏️ <strong>編集モード</strong>：PDFの内容を分析し、テキストと画像を個別のオブジェクトとして配置します。<br>
-        &nbsp;&nbsp;• <strong>テキスト</strong> → クリックして直接編集可能なテキストボックス<br>
-        &nbsp;&nbsp;• <strong>画像</strong> → 自由に移動・リサイズ可能な画像オブジェクト<br>
-        ※ PDFの背景デザインは再現されない場合があります
+        ✏️ <strong>編集モード</strong>：図・画像を背景として保持しつつ、テキストだけを編集可能にします。<br>
+        &nbsp;&nbsp;• <strong>図・写真・装飾</strong> → 背景画像としてそのまま表示<br>
+        &nbsp;&nbsp;• <strong>テキスト</strong> → 白いテキストボックスで上書き配置（クリックで編集可能）
     </div>
     """, unsafe_allow_html=True)
 
@@ -109,12 +108,7 @@ with col2:
         )
         img_fmt = "png" if "PNG" in img_fmt_label else "jpeg"
     else:
-        keep_bg = st.checkbox(
-            "🖼️ 背景画像も保持する",
-            value=False,
-            key="keep_bg_val",
-            help="チェックを入れると、テキスト・画像レイヤーに加えて、元ページの画像を背景として追加します（参考用）"
-        )
+        st.info("📌 編集モードでは背景画像は常に保持されます", icon="ℹ️")
 
 st.divider()
 
@@ -234,6 +228,9 @@ def ocr_page_to_textboxes(slide, page, x_scale, y_scale, ocr_dpi=200):
             Emu(left_emu), Emu(top_emu),
             Emu(w_emu + 100000), Emu(h_emu + 50000)
         )
+        txBox.fill.solid()
+        txBox.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        txBox.line.fill.background()
         tf = txBox.text_frame
         tf.word_wrap     = False
         tf.margin_left   = Emu(0)
@@ -294,8 +291,9 @@ def is_background_image(bbox, page_w, page_h, threshold=0.80):
 
 def convert_edit_mode(doc, keep_bg, dpi, progress_bar):
     """
-    編集モード：テキストをテキストボックス、画像を独立オブジェクトとして配置。
-    keep_bg=True の場合は背景画像も最背面に追加。
+    編集モード：
+    1. ページ全体を背景画像として配置（図・画像を保持）
+    2. テキストを白背景のテキストボックスで上書き配置（クリックで編集可能）
     戻り値: (Presentation, total_textboxes, total_images)
     """
     emu_per_point = 914400 / 72
@@ -322,13 +320,12 @@ def convert_edit_mode(doc, keep_bg, dpi, progress_bar):
 
         slide = prs.slides.add_slide(blank_layout)
 
-        # ── 背景画像（オプション） ──────────────────────
-        if keep_bg:
-            bg_buf = render_page_image(page, dpi, "png")
-            slide.shapes.add_picture(
-                bg_buf, Emu(0), Emu(0),
-                width=Emu(slide_w_emu), height=Emu(slide_h_emu)
-            )
+        # ── 背景画像（常に追加：図・写真・装飾を保持）──────
+        bg_buf = render_page_image(page, dpi, "png")
+        slide.shapes.add_picture(
+            bg_buf, Emu(0), Emu(0),
+            width=Emu(slide_w_emu), height=Emu(slide_h_emu)
+        )
 
         # ── 埋め込み画像を個別オブジェクトとして追加 ────
         added_xrefs = set()
@@ -408,6 +405,10 @@ def convert_edit_mode(doc, keep_bg, dpi, progress_bar):
                     Emu(left_emu), Emu(top_emu),
                     Emu(w_emu + 50000), Emu(h_emu + 50000)
                 )
+                # 白背景で背景テキストを隠し、編集可能なボックスとして表示
+                txBox.fill.solid()
+                txBox.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                txBox.line.fill.background()  # 枠線なし
                 tf = txBox.text_frame
                 tf.word_wrap     = True
                 tf.auto_size     = None
