@@ -1,4 +1,3 @@
-[app.py](https://github.com/user-attachments/files/25431333/app.py)
 """
 PDF → PowerPoint 変換ツール
 ・画像モード: 各ページを高品質な画像としてスライドに変換
