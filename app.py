@@ -91,7 +91,7 @@ with col1:
     dpi = st.select_slider(
         "🎨 画像品質（DPI）",
         options=[72, 96, 144, 200, 300],
-        value=150,
+        value=144,
         help="画像モードのみに影響します。編集モードでは背景なしのため不要です。"
     )
 with col2:
